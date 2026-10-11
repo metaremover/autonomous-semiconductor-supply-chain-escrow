@@ -4,7 +4,7 @@
 **Target Account**: [`metaremover`](https://github.com/metaremover)  
 **Repository**: [https://github.com/metaremover/autonomous-semiconductor-supply-chain-escrow](https://github.com/metaremover/autonomous-semiconductor-supply-chain-escrow)  
 **Execution Environment**: GenLayer Studio Testnet  
-**Contract Address**: [`0x0002121eAc69F3EE6b0728f9206F584399878c98`](https://explorer-studio.genlayer.com/address/0x0002121eAc69F3EE6b0728f9206F584399878c98)  
+**Contract Address**: [`0x98271bC7f61DC50cB04e86cAec9428c699963f5e`](https://explorer-studio.genlayer.com/address/0x98271bC7f61DC50cB04e86cAec9428c699963f5e)  
 
 ---
 
@@ -104,6 +104,11 @@ The cross-border semiconductor supply chain is acutely vulnerable to sudden geop
 6. **Non-Admin Consensus Clock**: Evaluates deadlines strictly using consensus UTC timestamps (`datetime.datetime.now(datetime.timezone.utc).timestamp()`).
 7. **Timeout Bond Safeguard**: Claimants can reclaim their bond after a 7-day timeout if regulatory endpoints become unreachable.
 8. **Pull-Pattern Balance Recovery**: Failed native EVM disbursements automatically credit `claimable_balances[recipient]`. `withdraw_claimable()` optimistically zeroes the balance and restores it upon failure.
+9. **Safe Fallback on Ingestion / Parsing Glitches (CRIT-01)**: If consensus JSON parsing or LLM response formatting errors occur, verdicts default strictly to `CLAIM_INCONCLUSIVE`, protecting claimant bonds from unjust slashing.
+10. **Solvency Accounting Guarantee (CRIT-02)**: `total_volume_locked` is decremented strictly upon successful native transfer. Failed transfers retain TVL backing until funds are withdrawn via `withdraw_claimable()`, eliminating double decrements.
+11. **Dispute State Locking (HIGH-01)**: Filing a dispute immediately transitions the escrow to `STATUS_DISPUTED`, locking the state and preventing front-running delivery confirmation or premature expiry reclamation.
+12. **Prompt Sanitation Defense (HIGH-02)**: Strips HTML tags and script/style bloat via regex before prompt injection, preventing context truncation and false refutations.
+13. **Dispute Deadline Enforcement (MED-03)**: Strictly verifies that claims are submitted before the delivery deadline (`now_utc <= delivery_deadline`).
 
 ---
 
@@ -160,8 +165,8 @@ python test/test_semiconductor_supply_escrow.py
 
 ## 6. Live Deployment & Explorer Verification
 
-- **Contract Address**: `0x0002121eAc69F3EE6b0728f9206F584399878c98`
-- **Deployment Tx Hash**: `0x05e8ba1c6a0e332045f5b66bddd1f7779c305192484f51fb19ad8d2117279e27`
+- **Contract Address**: `0x98271bC7f61DC50cB04e86cAec9428c699963f5e`
+- **Deployment Tx Hash**: `0x80d3dee7a4ace55e0ea7b9c1c866cd819fe86558e42cbb5f540e55c9cb6c4924`
 - **Network**: GenLayer Studio Testnet
-- **Explorer URL**: [https://explorer-studio.genlayer.com/address/0x0002121eAc69F3EE6b0728f9206F584399878c98](https://explorer-studio.genlayer.com/address/0x0002121eAc69F3EE6b0728f9206F584399878c98)
+- **Explorer URL**: [https://explorer-studio.genlayer.com/address/0x98271bC7f61DC50cB04e86cAec9428c699963f5e](https://explorer-studio.genlayer.com/address/0x98271bC7f61DC50cB04e86cAec9428c699963f5e)
 - **RPC Endpoint**: `https://studio.genlayer.com/api`
