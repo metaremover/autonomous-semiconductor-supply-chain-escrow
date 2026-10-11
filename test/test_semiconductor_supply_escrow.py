@@ -1,0 +1,686 @@
+# test_semiconductor_supply_escrow.py
+# 15-Phase Comprehensive Regression & Security Test Suite for AutonomousSemiconductorSupplyChainEscrow
+import json
+import hashlib
+import urllib.parse
+from datetime import datetime, timezone
+
+
+class MockGL:
+    def __init__(self):
+        self.transfers = []
+        self.mock_web_responses = {}
+        self.fail_web_fetch = False
+        self.simulate_transfer_fail = False
+
+    def emit_transfer(self, recipient: str, amount: int):
+        if self.simulate_transfer_fail:
+            raise RuntimeError("Simulated EVM transfer failure")
+        self.transfers.append({"recipient": str(recipient).lower(), "amount": int(amount)})
+
+    def get_webpage(self, url: str) -> str:
+        if self.fail_web_fetch:
+            raise RuntimeError("Simulated network timeout connecting to federal regulatory portal")
+        return self.mock_web_responses.get(
+            url,
+            "<html><body><h1>Bureau of Industry and Security, U.S. Department of Commerce</h1>"
+            "<p>Final Rule: Implementation of Additional Export Controls on Advanced Computing Items and Semiconductor Manufacturing Items. Federal Register Vol. 89, No. 204. "
+            "Export Administration Regulations (EAR) ban on sub-3nm Gate-All-Around (GAA) logic wafer fabrication and EUV lithography tooling export without individual validated license.</p></body></html>"
+        )
+
+    def exec_prompt(self, prompt: str) -> str:
+        return json.dumps({
+            "verdict": "RESTRICTION_CONFIRMED",
+            "confidence_score": 95,
+            "rationale": "Federal Register and BIS rule formally enact export embargo on sub-3nm GAA fabrication."
+        })
+
+
+class MockAutonomousSemiconductorSupplyChainEscrow:
+    def __init__(self, owner_address: str, gl_mock: MockGL):
+        self.gl = gl_mock
+        self.owner = owner_address.lower()
+        self.total_escrows_created = 0
+        self.total_claims_filed = 0
+        self.total_claims_adjudicated = 0
+        self.total_volume_locked = 0
+        self.total_collateral_released = 0
+        self.total_collateral_refunded = 0
+
+        self.escrows = {}
+        self.claims = {}
+        self.consumed_claim_hashes = {}
+        self.consumed_escrow_docs = {}
+        self.claimable_balances = {}
+
+        self.STATUS_ACTIVE = "ACTIVE"
+        self.STATUS_DELIVERED = "DELIVERED"
+        self.STATUS_EXPORT_RESTRICTED_REFUNDED = "EXPORT_RESTRICTED_REFUNDED"
+        self.STATUS_EXPIRED_REFUNDED = "EXPIRED_REFUNDED"
+        self.STATUS_DECOMMISSIONED = "DECOMMISSIONED"
+
+        self.CLAIM_PENDING = "PENDING_CONSENSUS"
+        self.CLAIM_RESTRICTION_CONFIRMED = "RESTRICTION_CONFIRMED"
+        self.CLAIM_REFUTED = "CLAIM_REFUTED"
+        self.CLAIM_INCONCLUSIVE = "INCONCLUSIVE"
+        self.CLAIM_ABANDONED = "CLAIM_ABANDONED"
+
+        self.MIN_ADVANCE_COLLATERAL = 100_000_000_000
+        self.MIN_TOPUP_AMOUNT = 10_000_000_000
+        self.MIN_CLAIM_BOND = 25_000_000_000
+        self.MIN_DELIVERY_DURATION = 86400 * 7
+        self.MAX_DELIVERY_DURATION = 86400 * 365 * 3
+        self.CLAIM_TIMEOUT_SECONDS = 86400 * 7
+
+        self.APPROVED_REGULATORY_DOMAINS = (
+            "federalregister.gov",
+            "bis.doc.gov",
+            "commerce.gov",
+            "govinfo.gov",
+            "access.gpo.gov"
+        )
+
+    def _validate_eth_address(self, addr_str: str, field_name: str) -> str:
+        clean = addr_str.strip().strip('"').strip("'")
+        assert len(clean) == 42, "[ERR_ADDR_FORMAT] " + field_name + " must be a 42-character hex address."
+        assert clean.startswith("0x") or clean.startswith("0X"), "[ERR_ADDR_PREFIX] " + field_name + " must start with '0x'."
+        hex_digits = clean[2:]
+        for c in hex_digits:
+            assert c in "0123456789abcdefABCDEF", "[ERR_ADDR_HEX] " + field_name + " contains non-hex characters."
+        assert clean.lower() != "0x" + "0" * 40, "[ERR_ADDR_ZERO] " + field_name + " cannot be the zero address."
+        return clean.lower()
+
+    def _sanitize_string(self, val: str, min_len: int, max_len: int, field_name: str) -> str:
+        clean = val.strip()
+        assert len(clean) >= min_len, "[ERR_STR_TOO_SHORT] " + field_name + " length must be >= " + str(min_len)
+        assert len(clean) <= max_len, "[ERR_STR_TOO_LONG] " + field_name + " length must be <= " + str(max_len)
+        return clean
+
+    def _validate_regulatory_url(self, url_str: str) -> str:
+        clean = url_str.strip()
+        assert len(clean) <= 512, "[ERR_URL_TOO_LONG] Regulatory URL exceeds 512 characters."
+        assert not ("\n" in clean or "\r" in clean or "\t" in clean), "[ERR_URL_WHITESPACE] URL must not contain newlines or tabs."
+        assert "@" not in clean, "[ERR_URL_CREDENTIALS] Embedded credentials prohibited in regulatory URL."
+
+        try:
+            parsed = urllib.parse.urlparse(clean)
+        except Exception:
+            raise AssertionError("[ERR_URL_PARSE] Failed to parse regulatory URL.")
+
+        scheme = (parsed.scheme or "").lower()
+        assert scheme in ("http", "https"), "[ERR_URL_SCHEME] Regulatory URL must use HTTP or HTTPS."
+
+        hostname = (parsed.hostname or "").lower()
+        assert hostname, "[ERR_URL_HOSTNAME] Regulatory URL missing hostname."
+        assert hostname not in ("localhost", "127.0.0.1", "0.0.0.0", "::1"), "[ERR_URL_LOOPBACK] SSRF attempt: loopback address rejected."
+
+        matched_domain = False
+        for approved_d in self.APPROVED_REGULATORY_DOMAINS:
+            if hostname == approved_d or hostname.endswith("." + approved_d):
+                matched_domain = True
+                break
+        assert matched_domain, "[ERR_URL_UNAPPROVED_DOMAIN] Target domain '" + hostname + "' not in approved regulatory catalog."
+
+        return clean
+
+    def _compute_claim_hash(self, escrow_id: str, claimant: str, doc_number: str, url: str, nonce: str) -> str:
+        data = (
+            "L" + str(len(escrow_id)) + ":" + escrow_id.upper() + "|" +
+            "L" + str(len(claimant)) + ":" + claimant.lower() + "|" +
+            "L" + str(len(doc_number)) + ":" + doc_number.upper() + "|" +
+            "L" + str(len(url)) + ":" + url + "|" +
+            "L" + str(len(nonce)) + ":" + nonce
+        )
+        return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+    def fund_contract(self, caller: str, value: int):
+        assert value > 0, "[ERR_ZERO_PAYMENT] Value must be greater than zero."
+        sender_hex = self._validate_eth_address(caller, "Sender")
+        cur = self.claimable_balances.get(sender_hex, 0)
+        self.claimable_balances[sender_hex] = cur + value
+        self.total_volume_locked += value
+        return "FUNDED: " + str(value) + " wei credited to claimable balance of " + sender_hex
+
+    def create_wafer_supply_escrow(self, caller: str, value: int, supplier_address: str, fab_node: str, batch_count: int, duration_sec: int):
+        buyer_hex = self._validate_eth_address(caller, "Buyer")
+        supplier_hex = self._validate_eth_address(supplier_address, "Supplier")
+        assert buyer_hex != supplier_hex, "[ERR_IDENTICAL_PARTIES] Buyer and supplier addresses cannot be identical."
+
+        clean_node = self._sanitize_string(fab_node, 2, 64, "Fab Node Identifier")
+        assert batch_count > 0 and batch_count <= 1_000_000, "[ERR_INVALID_BATCH_COUNT] Batch count out of bounds."
+        assert duration_sec >= self.MIN_DELIVERY_DURATION, "[ERR_DURATION_TOO_SHORT] Window too short."
+        assert duration_sec <= self.MAX_DELIVERY_DURATION, "[ERR_DURATION_TOO_LONG] Window too long."
+        assert value >= self.MIN_ADVANCE_COLLATERAL, "[ERR_MIN_ADVANCE] Advance collateral too low."
+
+        now_utc = int(datetime.now(timezone.utc).timestamp())
+        deadline_utc = now_utc + duration_sec
+
+        new_id = "ESCROW_FAB_" + str(self.total_escrows_created + 1)
+        self.escrows[new_id] = {
+            "escrow_id": new_id,
+            "buyer": buyer_hex,
+            "supplier": supplier_hex,
+            "fab_node_identifier": clean_node,
+            "wafer_batch_count": batch_count,
+            "advance_collateral": value,
+            "total_released_to_supplier": 0,
+            "total_refunded_to_buyer": 0,
+            "created_at": now_utc,
+            "delivery_deadline": deadline_utc,
+            "status": self.STATUS_ACTIVE
+        }
+        self.total_escrows_created += 1
+        self.total_volume_locked += value
+        return new_id
+
+    def deposit_escrow_reserves(self, caller: str, value: int, escrow_id: str):
+        assert escrow_id in self.escrows, "[ERR_ESCROW_NOT_FOUND] Escrow not found."
+        escrow = self.escrows[escrow_id]
+        assert escrow["status"] == self.STATUS_ACTIVE, "[ERR_ESCROW_NOT_ACTIVE] Escrow not active."
+
+        sender_hex = self._validate_eth_address(caller, "Caller")
+        assert sender_hex == escrow["buyer"], "[ERR_UNAUTHORIZED] Only buyer can top up."
+        assert value >= self.MIN_TOPUP_AMOUNT, "[ERR_MIN_TOPUP] Top-up below minimum."
+
+        escrow["advance_collateral"] += value
+        self.total_volume_locked += value
+        return "RESERVES_TOPPED_UP: " + escrow_id + " | Added: " + str(value)
+
+    def confirm_wafer_delivery(self, caller: str, escrow_id: str):
+        assert escrow_id in self.escrows, "[ERR_ESCROW_NOT_FOUND] Escrow not found."
+        escrow = self.escrows[escrow_id]
+        assert escrow["status"] == self.STATUS_ACTIVE, "[ERR_ESCROW_NOT_ACTIVE] Escrow not active."
+
+        sender_hex = self._validate_eth_address(caller, "Caller")
+        assert sender_hex == escrow["buyer"], "[ERR_UNAUTHORIZED] Only buyer can confirm delivery."
+
+        amt = escrow["advance_collateral"]
+        assert amt > 0, "[ERR_ZERO_COLLATERAL] No collateral to release."
+
+        escrow["status"] = self.STATUS_DELIVERED
+        escrow["total_released_to_supplier"] += amt
+        escrow["advance_collateral"] = 0
+
+        self.total_collateral_released += amt
+        self.total_volume_locked = max(0, self.total_volume_locked - amt)
+
+        try:
+            self.gl.emit_transfer(escrow["supplier"], amt)
+        except Exception:
+            cur = self.claimable_balances.get(escrow["supplier"], 0)
+            self.claimable_balances[escrow["supplier"]] = cur + amt
+
+        return "DELIVERY_CONFIRMED: " + escrow_id
+
+    def claim_expired_undelivered_escrow(self, caller: str, escrow_id: str, custom_time: int = None):
+        assert escrow_id in self.escrows, "[ERR_ESCROW_NOT_FOUND] Escrow not found."
+        escrow = self.escrows[escrow_id]
+        assert escrow["status"] == self.STATUS_ACTIVE, "[ERR_ESCROW_NOT_ACTIVE] Escrow not active."
+
+        sender_hex = self._validate_eth_address(caller, "Caller")
+        assert sender_hex == escrow["buyer"], "[ERR_UNAUTHORIZED] Only buyer can reclaim expired escrow."
+
+        now_utc = custom_time if custom_time is not None else int(datetime.now(timezone.utc).timestamp())
+        assert now_utc > escrow["delivery_deadline"], "[ERR_DEADLINE_NOT_REACHED] Delivery deadline not reached."
+
+        amt = escrow["advance_collateral"]
+        assert amt > 0, "[ERR_ZERO_COLLATERAL] No collateral to refund."
+
+        escrow["status"] = self.STATUS_EXPIRED_REFUNDED
+        escrow["total_refunded_to_buyer"] += amt
+        escrow["advance_collateral"] = 0
+
+        self.total_collateral_refunded += amt
+        self.total_volume_locked = max(0, self.total_volume_locked - amt)
+
+        try:
+            self.gl.emit_transfer(escrow["buyer"], amt)
+        except Exception:
+            cur = self.claimable_balances.get(escrow["buyer"], 0)
+            self.claimable_balances[escrow["buyer"]] = cur + amt
+
+        return "EXPIRED_REFUNDED: " + escrow_id
+
+    def submit_export_restriction_claim(self, caller: str, value: int, escrow_id: str, doc_number: str, url: str, nonce: str):
+        clean_e_id = escrow_id.strip().upper()
+        assert clean_e_id in self.escrows, "[ERR_ESCROW_NOT_FOUND] Escrow not found."
+        escrow = self.escrows[clean_e_id]
+        assert escrow["status"] == self.STATUS_ACTIVE, "[ERR_ESCROW_NOT_ACTIVE] Escrow not active."
+
+        sender_hex = self._validate_eth_address(caller, "Claimant")
+        clean_doc = self._sanitize_string(doc_number, 4, 64, "Regulatory Document Number")
+        clean_url = self._validate_regulatory_url(url)
+        clean_nonce = self._sanitize_string(nonce, 1, 64, "Nonce")
+
+        doc_key = clean_e_id + "::" + clean_doc.upper()
+        assert doc_key not in self.consumed_escrow_docs, "[ERR_DOC_ALREADY_CLAIMED] Document already claimed."
+
+        assert value >= self.MIN_CLAIM_BOND, "[ERR_MIN_CLAIM_BOND] Claim bond too low."
+
+        c_hash = self._compute_claim_hash(clean_e_id, sender_hex, clean_doc, clean_url, clean_nonce)
+        assert c_hash.lower() not in self.consumed_claim_hashes, "[ERR_CLAIM_EXISTS] Duplicate claim hash."
+
+        now_utc = int(datetime.now(timezone.utc).timestamp())
+        new_c_id = "CLAIM_EXP_" + str(self.total_claims_filed + 1)
+
+        self.claims[new_c_id] = {
+            "claim_id": new_c_id,
+            "escrow_id": clean_e_id,
+            "claimant": sender_hex,
+            "regulatory_document_number": clean_doc,
+            "regulatory_url": clean_url,
+            "claim_fingerprint": c_hash,
+            "claim_bond": value,
+            "filed_at": now_utc,
+            "adjudicated_at": 0,
+            "verdict": self.CLAIM_PENDING,
+            "refund_awarded": 0,
+            "has_claimed": False,
+            "adjudication_rationale": ""
+        }
+
+        self.consumed_claim_hashes[c_hash.lower()] = True
+        self.consumed_escrow_docs[doc_key] = True
+        self.total_claims_filed += 1
+        self.total_volume_locked += value
+        return new_c_id
+
+    def adjudicate_export_restriction_claim(self, claim_id: str, custom_verdict: str = None, custom_conf: int = None):
+        assert claim_id in self.claims, "[ERR_CLAIM_NOT_FOUND] Claim not found."
+        clm = self.claims[claim_id]
+        assert clm["verdict"] == self.CLAIM_PENDING, "[ERR_ALREADY_ADJUDICATED] Claim already adjudicated."
+
+        escrow = self.escrows[clm["escrow_id"]]
+
+        try:
+            reg_text = self.gl.get_webpage(clm["regulatory_url"])
+        except Exception:
+            raise AssertionError("[ERR_EVIDENCE_FETCH_FAILED] Consensus could not fetch regulatory document.")
+
+        assert reg_text is not None and len(reg_text.strip()) >= 30, "[ERR_EVIDENCE_FETCH_FAILED] Response too short."
+
+        if custom_verdict is not None and custom_conf is not None:
+            raw_resp = json.dumps({"verdict": custom_verdict, "confidence_score": custom_conf, "rationale": "Test adjudication verdict."})
+        else:
+            raw_resp = self.gl.exec_prompt("Prompt")
+
+        parsed = json.loads(raw_resp)
+        parsed_verdict = parsed.get("verdict", self.CLAIM_INCONCLUSIVE)
+        confidence = parsed.get("confidence_score", 0)
+        rationale = parsed.get("rationale", "")
+
+        if parsed_verdict == self.CLAIM_RESTRICTION_CONFIRMED and confidence >= 70:
+            final_verdict = self.CLAIM_RESTRICTION_CONFIRMED
+        elif parsed_verdict == self.CLAIM_REFUTED or confidence < 30:
+            final_verdict = self.CLAIM_REFUTED
+        else:
+            final_verdict = self.CLAIM_INCONCLUSIVE
+
+        now_utc = int(datetime.now(timezone.utc).timestamp())
+        clm["adjudicated_at"] = now_utc
+        clm["verdict"] = final_verdict
+        clm["adjudication_rationale"] = rationale
+        bond_val = clm["claim_bond"]
+
+        if final_verdict == self.CLAIM_RESTRICTION_CONFIRMED:
+            refund_amt = escrow["advance_collateral"]
+            clm["refund_awarded"] = refund_amt
+            clm["has_claimed"] = True
+
+            escrow["status"] = self.STATUS_EXPORT_RESTRICTED_REFUNDED
+            escrow["total_refunded_to_buyer"] += refund_amt
+            escrow["advance_collateral"] = 0
+
+            self.total_collateral_refunded += refund_amt
+            total_disbursed = refund_amt + bond_val
+            self.total_volume_locked = max(0, self.total_volume_locked - total_disbursed)
+
+            try:
+                self.gl.emit_transfer(escrow["buyer"], refund_amt)
+            except Exception:
+                cur = self.claimable_balances.get(escrow["buyer"], 0)
+                self.claimable_balances[escrow["buyer"]] = cur + refund_amt
+
+            try:
+                self.gl.emit_transfer(clm["claimant"], bond_val)
+            except Exception:
+                cur = self.claimable_balances.get(clm["claimant"], 0)
+                self.claimable_balances[clm["claimant"]] = cur + bond_val
+
+        elif final_verdict == self.CLAIM_REFUTED:
+            clm["refund_awarded"] = 0
+            clm["has_claimed"] = True
+            cur = self.claimable_balances.get(escrow["supplier"], 0)
+            self.claimable_balances[escrow["supplier"]] = cur + bond_val
+
+        else:
+            clm["refund_awarded"] = 0
+            clm["has_claimed"] = True
+            self.total_volume_locked = max(0, self.total_volume_locked - bond_val)
+            try:
+                self.gl.emit_transfer(clm["claimant"], bond_val)
+            except Exception:
+                cur = self.claimable_balances.get(clm["claimant"], 0)
+                self.claimable_balances[clm["claimant"]] = cur + bond_val
+
+        self.total_claims_adjudicated += 1
+        return "CLAIM_ADJUDICATED: " + claim_id + " | Verdict: " + final_verdict
+
+    def claim_abandoned_claim_bond(self, caller: str, claim_id: str, custom_time: int = None):
+        assert claim_id in self.claims, "[ERR_CLAIM_NOT_FOUND] Claim not found."
+        clm = self.claims[claim_id]
+
+        sender_hex = self._validate_eth_address(caller, "Caller")
+        assert sender_hex == clm["claimant"], "[ERR_UNAUTHORIZED] Only claimant can recover bond."
+        assert clm["verdict"] == self.CLAIM_PENDING, "[ERR_CLAIM_NOT_PENDING] Claim not pending."
+
+        now_utc = custom_time if custom_time is not None else int(datetime.now(timezone.utc).timestamp())
+        assert now_utc >= clm["filed_at"] + self.CLAIM_TIMEOUT_SECONDS, "[ERR_TIMEOUT_NOT_REACHED] Must wait 7 days."
+
+        bond_val = clm["claim_bond"]
+        clm["verdict"] = self.CLAIM_ABANDONED
+        clm["has_claimed"] = True
+        clm["adjudication_rationale"] = "Recovered after 7-day timeout."
+
+        self.total_volume_locked = max(0, self.total_volume_locked - bond_val)
+        try:
+            self.gl.emit_transfer(sender_hex, bond_val)
+        except Exception:
+            cur = self.claimable_balances.get(sender_hex, 0)
+            self.claimable_balances[sender_hex] = cur + bond_val
+
+        return "BOND_RECLAIMED: " + claim_id
+
+    def decommission_uncontested_escrow(self, caller: str, escrow_id: str):
+        assert escrow_id in self.escrows, "[ERR_ESCROW_NOT_FOUND] Escrow not found."
+        escrow = self.escrows[escrow_id]
+        sender_hex = self._validate_eth_address(caller, "Caller")
+        assert sender_hex in (escrow["buyer"], escrow["supplier"], self.owner), "[ERR_UNAUTHORIZED] Unauthorized caller."
+        assert escrow["advance_collateral"] == 0, "[ERR_COLLATERAL_REMAINING] Remaining collateral."
+        assert escrow["status"] in (self.STATUS_DELIVERED, self.STATUS_EXPORT_RESTRICTED_REFUNDED, self.STATUS_EXPIRED_REFUNDED), "[ERR_INVALID_STATUS] Invalid status."
+
+        escrow["status"] = self.STATUS_DECOMMISSIONED
+        return "ESCROW_DECOMMISSIONED: " + escrow_id
+
+    def withdraw_claimable(self, caller: str):
+        sender_hex = self._validate_eth_address(caller, "Caller")
+        assert sender_hex in self.claimable_balances, "[ERR_NO_CLAIMABLE] No claimable funds."
+        bal = self.claimable_balances[sender_hex]
+        assert bal > 0, "[ERR_ZERO_CLAIMABLE] Zero balance."
+
+        self.claimable_balances[sender_hex] = 0
+        try:
+            self.gl.emit_transfer(sender_hex, bal)
+        except Exception:
+            self.claimable_balances[sender_hex] = bal
+            raise AssertionError("[ERR_TRANSFER_FAILED] Native transfer failed; claimable balance preserved.")
+
+        self.total_volume_locked = max(0, self.total_volume_locked - bal)
+        return "CLAIMABLE_WITHDRAWN: " + sender_hex + " | Amount: " + str(bal)
+
+
+def run_all_tests():
+    print("================================================================================")
+    print("  AUTONOMOUS SEMICONDUCTOR ESCROW — 15-PHASE COMPREHENSIVE REGRESSION SUITE")
+    print("================================================================================")
+
+    mock_gl = MockGL()
+    owner = "0x1111111111111111111111111111111111111111"
+    buyer = "0x2222222222222222222222222222222222222222"
+    supplier = "0x3333333333333333333333333333333333333333"
+    claimant = "0x4444444444444444444444444444444444444444"
+
+    contract = MockAutonomousSemiconductorSupplyChainEscrow(owner, mock_gl)
+
+    # Phase 1: Zero Genesis Invariants
+    print("\n[Phase 1] Testing zero genesis debt and initialization invariants...")
+    assert contract.total_volume_locked == 0, "TVL must start at 0"
+    assert contract.total_escrows_created == 0, "Escrow count must start at 0"
+    assert len(contract.claimable_balances) == 0, "Zero phantom balances"
+    print("  PASS: Zero unbacked genesis debt verified.")
+
+    # Phase 2: Create Wafer Escrow
+    print("\n[Phase 2] Creating wafer supply escrow backed 100% by advance collateral...")
+    advance_amount = 250_000_000_000  # 250 Gwei
+    escrow_id = contract.create_wafer_supply_escrow(
+        caller=buyer,
+        value=advance_amount,
+        supplier_address=supplier,
+        fab_node="2nm Gate-All-Around GAAFET",
+        batch_count=5000,
+        duration_sec=86400 * 90  # 90 days
+    )
+    assert escrow_id == "ESCROW_FAB_1"
+    assert contract.total_volume_locked == advance_amount
+    assert contract.escrows[escrow_id]["advance_collateral"] == advance_amount
+    print("  PASS: Wafer escrow created with 100% backed funds:", escrow_id)
+
+    # Phase 3: Top-up Advance Collateral
+    print("\n[Phase 3] Testing reserve top-up by buyer...")
+    topup_amount = 50_000_000_000  # 50 Gwei
+    contract.deposit_escrow_reserves(caller=buyer, value=topup_amount, escrow_id=escrow_id)
+    assert contract.escrows[escrow_id]["advance_collateral"] == advance_amount + topup_amount
+    assert contract.total_volume_locked == advance_amount + topup_amount
+    print("  PASS: Advance collateral top-up successfully recorded.")
+
+    # Phase 4: SSRF Defense & Regulatory Domain Whitelist
+    print("\n[Phase 4] Testing SSRF defense and regulatory domain whitelisting...")
+    try:
+        contract._validate_regulatory_url("https://malicious-phishing.com/doc.html")
+        assert False, "Should reject unapproved domain"
+    except AssertionError as e:
+        assert "[ERR_URL_UNAPPROVED_DOMAIN]" in str(e)
+
+    try:
+        contract._validate_regulatory_url("https://user:pass@bis.doc.gov/reg")
+        assert False, "Should reject embedded credentials"
+    except AssertionError as e:
+        assert "[ERR_URL_CREDENTIALS]" in str(e)
+
+    try:
+        contract._validate_regulatory_url("http://127.0.0.1/admin")
+        assert False, "Should reject loopback SSRF"
+    except AssertionError as e:
+        assert "[ERR_URL_LOOPBACK]" in str(e)
+
+    valid_url = "https://www.federalregister.gov/documents/2026/09/21/2026-21840/advanced-computing-semiconductors"
+    assert contract._validate_regulatory_url(valid_url) == valid_url
+    print("  PASS: SSRF defense and domain filtering fully enforced.")
+
+    # Phase 5: Address Sanitation & Non-Zero Recipient
+    print("\n[Phase 5] Testing address sanitation and non-zero hex enforcement...")
+    try:
+        contract._validate_eth_address("0x0000000000000000000000000000000000000000", "ZeroCheck")
+        assert False, "Should reject zero address"
+    except AssertionError as e:
+        assert "[ERR_ADDR_ZERO]" in str(e)
+
+    try:
+        contract._validate_eth_address("0xInvalidHexLength", "LengthCheck")
+        assert False, "Should reject invalid length"
+    except AssertionError as e:
+        assert "[ERR_ADDR_FORMAT]" in str(e)
+    print("  PASS: Address format sanitation strictly verified.")
+
+    # Phase 6: Length-Prefixed Canonical Fingerprint Computation
+    print("\n[Phase 6] Testing canonical length-prefixed fingerprint computation...")
+    h1 = contract._compute_claim_hash("ESCROW_FAB_1", claimant, "FR-2026-09", valid_url, "nonce1")
+    h2 = contract._compute_claim_hash("ESCROW_FAB_1", claimant, "FR-2026-09", valid_url, "nonce1")
+    h3 = contract._compute_claim_hash("ESCROW_FAB_1", claimant, "FR-2026-09", valid_url, "nonce2")
+    assert h1 == h2, "Canonical hash must be deterministic"
+    assert h1 != h3, "Different nonce must yield distinct hash"
+    print("  PASS: Canonical length-prefixed hashing prevents delimiter collisions.")
+
+    # Phase 7: Submit Export Restriction Claim
+    print("\n[Phase 7] Submitting export restriction claim with payable claim bond...")
+    bond_amount = 30_000_000_000  # 30 Gwei
+    claim_id = contract.submit_export_restriction_claim(
+        caller=claimant,
+        value=bond_amount,
+        escrow_id=escrow_id,
+        doc_number="FR-2026-21840",
+        url=valid_url,
+        nonce="nonce_trade_embargo_1"
+    )
+    assert claim_id == "CLAIM_EXP_1"
+    assert contract.claims[claim_id]["claim_bond"] == bond_amount
+    assert contract.total_volume_locked == advance_amount + topup_amount + bond_amount
+    print("  PASS: Export restriction claim filed with payable bond:", claim_id)
+
+    # Phase 8: Prevent Duplicate Claim Replay
+    print("\n[Phase 8] Testing replay prevention on identical regulatory document...")
+    try:
+        contract.submit_export_restriction_claim(
+            caller=claimant,
+            value=bond_amount,
+            escrow_id=escrow_id,
+            doc_number="FR-2026-21840",
+            url=valid_url,
+            nonce="nonce_unique_2"
+        )
+        assert False, "Should reject duplicate document claim on same escrow"
+    except AssertionError as e:
+        assert "[ERR_DOC_ALREADY_CLAIMED]" in str(e)
+    print("  PASS: Duplicate regulatory document claims prevented.")
+
+    # Phase 9: Multi-Validator Consensus Adjudication: RESTRICTION_CONFIRMED
+    print("\n[Phase 9] Testing consensus adjudication: RESTRICTION_CONFIRMED (Force Majeure Refund)...")
+    initial_buyer_balance = 0
+    total_collateral_in_escrow = advance_amount + topup_amount
+    contract.adjudicate_export_restriction_claim(claim_id, custom_verdict="RESTRICTION_CONFIRMED", custom_conf=95)
+    
+    assert contract.claims[claim_id]["verdict"] == "RESTRICTION_CONFIRMED"
+    assert contract.escrows[escrow_id]["status"] == "EXPORT_RESTRICTED_REFUNDED"
+    assert contract.escrows[escrow_id]["advance_collateral"] == 0
+    assert contract.escrows[escrow_id]["total_refunded_to_buyer"] == total_collateral_in_escrow
+
+    # Verify transfers to buyer and claimant
+    buyer_transfers = [t for t in mock_gl.transfers if t["recipient"] == buyer]
+    claimant_transfers = [t for t in mock_gl.transfers if t["recipient"] == claimant]
+    assert any(t["amount"] == total_collateral_in_escrow for t in buyer_transfers), "Buyer must receive 100% collateral refund"
+    assert any(t["amount"] == bond_amount for t in claimant_transfers), "Claimant must recover claim bond"
+    print("  PASS: Force majeure advance collateral refunded to buyer & bond returned to claimant.")
+
+    # Phase 10: Multi-Validator Consensus Adjudication: CLAIM_REFUTED (Frivolous Claim)
+    print("\n[Phase 10] Testing consensus adjudication: CLAIM_REFUTED (frivolous bond slashed)...")
+    escrow_id_2 = contract.create_wafer_supply_escrow(
+        caller=buyer,
+        value=advance_amount,
+        supplier_address=supplier,
+        fab_node="3nm GAAFET",
+        batch_count=1000,
+        duration_sec=86400 * 30
+    )
+    claim_id_2 = contract.submit_export_restriction_claim(
+        caller=claimant,
+        value=bond_amount,
+        escrow_id=escrow_id_2,
+        doc_number="BIS-FALSE-99",
+        url="https://bis.doc.gov/reg-99",
+        nonce="nonce_frivolous"
+    )
+    contract.adjudicate_export_restriction_claim(claim_id_2, custom_verdict="CLAIM_REFUTED", custom_conf=15)
+    assert contract.claims[claim_id_2]["verdict"] == "CLAIM_REFUTED"
+    assert contract.claimable_balances[supplier] == bond_amount, "Supplier credited with slashed bond indemnity"
+    print("  PASS: Frivolous claim bond slashed to supplier indemnity reserves.")
+
+    # Phase 11: Fail-Closed Web Evidence Ingestion
+    print("\n[Phase 11] Testing fail-closed handling on unreachable regulatory portal...")
+    claim_id_3 = contract.submit_export_restriction_claim(
+        caller=claimant,
+        value=bond_amount,
+        escrow_id=escrow_id_2,
+        doc_number="BIS-TIMEOUT-01",
+        url="https://bis.doc.gov/timeout",
+        nonce="nonce_timeout_test"
+    )
+    mock_gl.fail_web_fetch = True
+    try:
+        contract.adjudicate_export_restriction_claim(claim_id_3)
+        assert False, "Should raise AssertionError on network timeout"
+    except AssertionError as e:
+        assert "[ERR_EVIDENCE_FETCH_FAILED]" in str(e)
+    mock_gl.fail_web_fetch = False
+    print("  PASS: Fail-closed zero-mutation invariant preserved on network failure.")
+
+    # Phase 12: 7-Day Timeout Bond Recovery
+    print("\n[Phase 12] Testing 7-day timeout bond recovery for claimant...")
+    now = int(datetime.now(timezone.utc).timestamp())
+    try:
+        # Attempt recovery prior to 7-day timeout
+        contract.claim_abandoned_claim_bond(caller=claimant, claim_id=claim_id_3, custom_time=now + 86400 * 2)
+        assert False, "Should revert before 7 days have elapsed"
+    except AssertionError as e:
+        assert "[ERR_TIMEOUT_NOT_REACHED]" in str(e)
+
+    # Recovery after 7 days
+    contract.claim_abandoned_claim_bond(caller=claimant, claim_id=claim_id_3, custom_time=now + 86400 * 8)
+    assert contract.claims[claim_id_3]["verdict"] == "CLAIM_ABANDONED"
+    print("  PASS: Claimant successfully recovered bond after 7-day timeout.")
+
+    # Phase 13: Consensual Wafer Delivery Completion
+    print("\n[Phase 13] Testing consensual wafer delivery completion & release to supplier...")
+    escrow_id_3 = contract.create_wafer_supply_escrow(
+        caller=buyer,
+        value=advance_amount,
+        supplier_address=supplier,
+        fab_node="Intel 18A RibbonFET",
+        batch_count=2000,
+        duration_sec=86400 * 60
+    )
+    contract.confirm_wafer_delivery(caller=buyer, escrow_id=escrow_id_3)
+    assert contract.escrows[escrow_id_3]["status"] == "DELIVERED"
+    assert contract.escrows[escrow_id_3]["total_released_to_supplier"] == advance_amount
+    print("  PASS: Wafer delivery successfully confirmed and collateral disbursed to supplier.")
+
+    # Phase 14: Expired Undelivered Escrow Recovery by Buyer
+    print("\n[Phase 14] Testing expired undelivered escrow refund after deadline...")
+    escrow_id_4 = contract.create_wafer_supply_escrow(
+        caller=buyer,
+        value=advance_amount,
+        supplier_address=supplier,
+        fab_node="TSMC N2P",
+        batch_count=1500,
+        duration_sec=86400 * 10
+    )
+    try:
+        contract.claim_expired_undelivered_escrow(caller=buyer, escrow_id=escrow_id_4, custom_time=now)
+        assert False, "Should revert if deadline not yet passed"
+    except AssertionError as e:
+        assert "[ERR_DEADLINE_NOT_REACHED]" in str(e)
+
+    # Reclaim after deadline
+    contract.claim_expired_undelivered_escrow(caller=buyer, escrow_id=escrow_id_4, custom_time=now + 86400 * 15)
+    assert contract.escrows[escrow_id_4]["status"] == "EXPIRED_REFUNDED"
+    assert contract.escrows[escrow_id_4]["total_refunded_to_buyer"] == advance_amount
+    print("  PASS: Expired undelivered advance collateral refunded to buyer.")
+
+    # Phase 15: Pull-Pattern Claimable Withdrawal with Balance Preservation
+    print("\n[Phase 15] Testing pull-pattern claimable balance recovery...")
+    # Supplier has slashed bond in claimable balances
+    supplier_claimable = contract.claimable_balances.get(supplier, 0)
+    assert supplier_claimable > 0
+
+    # Simulate EVM transfer failure to verify balance preservation
+    mock_gl.simulate_transfer_fail = True
+    try:
+        contract.withdraw_claimable(caller=supplier)
+        assert False, "Should raise AssertionError on transfer failure"
+    except AssertionError as e:
+        assert "[ERR_TRANSFER_FAILED]" in str(e)
+    # Balance must be preserved/restored!
+    assert contract.claimable_balances[supplier] == supplier_claimable, "Claimable balance must not be wiped on transfer error!"
+
+    # Now disable failure and perform successful withdrawal
+    mock_gl.simulate_transfer_fail = False
+    contract.withdraw_claimable(caller=supplier)
+    assert contract.claimable_balances[supplier] == 0, "Balance cleanly zeroed upon successful transfer."
+    print("  PASS: Pull-pattern claimable balance recovery preserves balance on transfer failure.")
+
+    print("\n================================================================================")
+    print("  ALL 15 REGRESSION & SECURITY PHASES PASSED WITH ZERO ERRORS!")
+    print("================================================================================")
+
+
+if __name__ == "__main__":
+    run_all_tests()

@@ -1,0 +1,21 @@
+{
+  "name": "autonomous-semiconductor-supply-chain-escrow",
+  "version": "1.0.0",
+  "description": "Autonomous Wafer Fab Slot & Lithography Advance Escrow with U.S. Federal Register & BIS Export Control (EAR) Regulatory Adjudication on GenLayer",
+  "type": "module",
+  "scripts": {
+    "test": "python test/test_semiconductor_supply_escrow.py",
+    "deploy": "node scripts/deploy_semiconductor_supply_escrow.mjs"
+  },
+  "keywords": [
+    "genlayer",
+    "intelligent-contracts",
+    "semiconductor",
+    "export-control",
+    "bis",
+    "federal-register",
+    "escrow"
+  ],
+  "author": "metaremover <metaremover@users.noreply.github.com>",
+  "license": "MIT"
+}
