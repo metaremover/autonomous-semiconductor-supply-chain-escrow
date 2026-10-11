@@ -7,6 +7,38 @@ import urllib.parse
 from datetime import datetime, timezone
 
 
+class MockWeb:
+    def __init__(self, gl):
+        self.gl = gl
+
+    def render(self, url: str, mode: str = "text") -> str:
+        if self.gl.fail_web_fetch:
+            raise RuntimeError("Simulated network timeout connecting to federal regulatory portal")
+        return self.gl.mock_web_responses.get(
+            url,
+            "<html><body><h1>Bureau of Industry and Security, U.S. Department of Commerce</h1>"
+            "<p>Final Rule: Implementation of Additional Export Controls on Advanced Computing Items and Semiconductor Manufacturing Items. Federal Register Vol. 89, No. 204. "
+            "Export Administration Regulations (EAR) ban on sub-3nm Gate-All-Around (GAA) logic wafer fabrication and EUV lithography tooling export without individual validated license.</p></body></html>"
+        )
+
+
+class MockNondet:
+    def __init__(self, gl):
+        self.web = MockWeb(gl)
+
+
+class MockEqPrinciple:
+    def __init__(self, gl):
+        self.gl = gl
+
+    def prompt_non_comparative(self, get_input_fn, task="", criteria=""):
+        # Executes the get_input_fn to test evidence fetch
+        input_data = get_input_fn()
+        if self.gl.corrupt_llm_json:
+            return "This is a corrupted non-JSON LLM response that would normally cause JSONDecodeError."
+        return self.gl.consensus_return_value
+
+
 class MockGL:
     def __init__(self):
         self.transfers = []
@@ -14,30 +46,20 @@ class MockGL:
         self.fail_web_fetch = False
         self.simulate_transfer_fail = False
         self.corrupt_llm_json = False
+        self.nondet = MockNondet(self)
+        self.eq_principle = MockEqPrinciple(self)
+        self.consensus_return_value = json.dumps({
+            "document_matched": True,
+            "fab_node_restricted": True,
+            "confidence_score": 95,
+            "verdict": "RESTRICTION_CONFIRMED",
+            "rationale": "Federal Register and BIS rule formally enact export embargo on sub-3nm GAA fabrication."
+        })
 
     def emit_transfer(self, recipient: str, amount: int):
         if self.simulate_transfer_fail:
             raise RuntimeError("Simulated EVM transfer failure")
         self.transfers.append({"recipient": str(recipient).lower(), "amount": int(amount)})
-
-    def get_webpage(self, url: str) -> str:
-        if self.fail_web_fetch:
-            raise RuntimeError("Simulated network timeout connecting to federal regulatory portal")
-        return self.mock_web_responses.get(
-            url,
-            "<html><body><h1>Bureau of Industry and Security, U.S. Department of Commerce</h1>"
-            "<p>Final Rule: Implementation of Additional Export Controls on Advanced Computing Items and Semiconductor Manufacturing Items. Federal Register Vol. 89, No. 204. "
-            "Export Administration Regulations (EAR) ban on sub-3nm Gate-All-Around (GAA) logic wafer fabrication and EUV lithography tooling export without individual validated license.</p></body></html>"
-        )
-
-    def exec_prompt(self, prompt: str) -> str:
-        if self.corrupt_llm_json:
-            return "This is a corrupted non-JSON LLM response that would normally cause JSONDecodeError."
-        return json.dumps({
-            "verdict": "RESTRICTION_CONFIRMED",
-            "confidence_score": 95,
-            "rationale": "Federal Register and BIS rule formally enact export embargo on sub-3nm GAA fabrication."
-        })
 
 
 class MockAutonomousSemiconductorSupplyChainEscrow:
@@ -312,40 +334,53 @@ class MockAutonomousSemiconductorSupplyChainEscrow:
 
         escrow = self.escrows[clm["escrow_id"]]
 
-        try:
-            reg_text = self.gl.get_webpage(clm["regulatory_url"])
-        except Exception:
-            raise AssertionError("[ERR_EVIDENCE_FETCH_FAILED] Consensus could not fetch regulatory document.")
+        reg_url = clm["regulatory_url"]
+        target_fab = escrow["fab_node_identifier"]
+        doc_num = clm["regulatory_document_number"]
 
-        assert reg_text is not None and len(reg_text.strip()) >= 30, "[ERR_EVIDENCE_FETCH_FAILED] Response too short."
+        def get_input() -> str:
+            raw_data = self.gl.nondet.web.render(reg_url, mode="text")
+            assert raw_data is not None and len(raw_data.strip()) >= 30, \
+                "[ERR_EVIDENCE_FETCH_FAILED] Response too short."
+            cleaned = re.sub(r'<[^>]+>', ' ', raw_data)
+            return f"Target Fab Node: {target_fab}\nReference: {doc_num}\n\n{cleaned}"
 
-        # HTML sanitization (HIGH-02)
-        cleaned_text = re.sub(r'<[^>]+>', ' ', reg_text)
+        task = "Auditor Task: Analyze regulatory document."
+        criteria = "Auditor Criteria: Independently verify restrictions."
+
+        if simulate_parse_error:
+            self.gl.corrupt_llm_json = True
+        elif custom_verdict is not None and custom_conf is not None:
+            self.gl.corrupt_llm_json = False
+            self.gl.consensus_return_value = json.dumps({
+                "document_matched": True,
+                "fab_node_restricted": custom_verdict == self.CLAIM_RESTRICTION_CONFIRMED,
+                "confidence_score": custom_conf,
+                "verdict": custom_verdict,
+                "rationale": "Test adjudication verdict."
+            })
+        else:
+            self.gl.corrupt_llm_json = False
+
+        consensus_result = self.gl.eq_principle.prompt_non_comparative(
+            get_input,
+            task=task,
+            criteria=criteria
+        )
 
         parse_valid = False
         parsed_verdict = self.CLAIM_INCONCLUSIVE
         confidence = 0
         rationale = "Consensus fallback resolution."
 
-        if simulate_parse_error:
-            parse_valid = False
-        elif custom_verdict is not None and custom_conf is not None:
-            raw_resp = json.dumps({"verdict": custom_verdict, "confidence_score": custom_conf, "rationale": "Test adjudication verdict."})
-            parsed = json.loads(raw_resp)
+        try:
+            parsed = json.loads(consensus_result)
             parsed_verdict = parsed.get("verdict", self.CLAIM_INCONCLUSIVE)
             confidence = parsed.get("confidence_score", 0)
             rationale = parsed.get("rationale", "")
             parse_valid = True
-        else:
-            raw_resp = self.gl.exec_prompt("Prompt")
-            try:
-                parsed = json.loads(raw_resp)
-                parsed_verdict = parsed.get("verdict", self.CLAIM_INCONCLUSIVE)
-                confidence = parsed.get("confidence_score", 0)
-                rationale = parsed.get("rationale", "")
-                parse_valid = True
-            except Exception:
-                parse_valid = False
+        except Exception:
+            parse_valid = False
 
         # CRIT-01 Remediated Safe Fallback:
         if parse_valid and parsed_verdict == self.CLAIM_RESTRICTION_CONFIRMED and confidence >= 70:

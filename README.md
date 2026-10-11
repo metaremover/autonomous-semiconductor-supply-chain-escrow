@@ -4,7 +4,7 @@
 **Target Account**: [`metaremover`](https://github.com/metaremover)  
 **Repository**: [https://github.com/metaremover/autonomous-semiconductor-supply-chain-escrow](https://github.com/metaremover/autonomous-semiconductor-supply-chain-escrow)  
 **Execution Environment**: GenLayer Studio Testnet  
-**Contract Address**: [`0x98271bC7f61DC50cB04e86cAec9428c699963f5e`](https://explorer-studio.genlayer.com/address/0x98271bC7f61DC50cB04e86cAec9428c699963f5e)  
+**Contract Address**: [`0x3498f46D90944E136D7688e4C49a62d598Ffa1ea`](https://explorer-studio.genlayer.com/address/0x3498f46D90944E136D7688e4C49a62d598Ffa1ea)  
 
 ---
 
@@ -22,7 +22,7 @@ The cross-border semiconductor supply chain is acutely vulnerable to sudden geop
 ### The GenLayer Intelligent Solution
 `AutonomousSemiconductorSupplyChainEscrow` provides an autonomous, verifiable legal-financial bridge on GenLayer:
 - Escrows advance wafer allocation capital backed 100% by payable native funds (`@gl.public.write.payable`).
-- Integrates multi-validator equivalence consensus (`gl.exec_prompt` + `gl.get_webpage`) to ingest official publications directly from authoritative government repositories (`federalregister.gov`, `bis.doc.gov`, `commerce.gov`, `govinfo.gov`).
+- Integrates multi-validator equivalence consensus via GenLayer Equivalence Principle (`gl.eq_principle.prompt_non_comparative` + `gl.nondet.web.render`) where all validators independently refetch official publications directly from authoritative government repositories (`federalregister.gov`, `bis.doc.gov`, `commerce.gov`, `govinfo.gov`) and evaluate strict criteria.
 - Employs strict bidirectional consensus heuristics to classify regulatory publications:
   - **RESTRICTION_CONFIRMED**: Confirms an active export control ban impacting the target node/entity $\rightarrow$ Automatically releases 100% remaining advance collateral back to the fabless buyer and refunds the claimant's bond.
   - **CLAIM_REFUTED**: Frivolous or inapplicable claim $\rightarrow$ Slashes claim bond to the supplier's reserve balance.
