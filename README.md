@@ -1,7 +1,6 @@
 # AutonomousSemiconductorSupplyChainEscrow
 ### Autonomous Wafer Fab Slot & Lithography Advance Escrow with U.S. Federal Register & BIS Export Control (EAR) Regulatory Adjudication
 **Protocol Standard**: GenLayer Intelligent Contract v0.2.1  
-**Target Account**: [`metaremover`](https://github.com/metaremover)  
 **Repository**: [https://github.com/metaremover/autonomous-semiconductor-supply-chain-escrow](https://github.com/metaremover/autonomous-semiconductor-supply-chain-escrow)  
 **Execution Environment**: GenLayer Studio Testnet  
 **Contract Address**: [`0x3498f46D90944E136D7688e4C49a62d598Ffa1ea`](https://explorer-studio.genlayer.com/address/0x3498f46D90944E136D7688e4C49a62d598Ffa1ea)  
