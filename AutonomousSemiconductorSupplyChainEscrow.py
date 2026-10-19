@@ -529,27 +529,27 @@ class AutonomousSemiconductorSupplyChainEscrow(gl.Contract):
             "Extract and verify:\n"
             "1. 'document_matched': boolean (true if the regulatory publication matches the reference document number)\n"
             "2. 'fab_node_restricted': boolean (true if the specific fab node/technology is restricted or prohibited)\n"
-            "3. 'confidence_score': integer between 0 and 100\n"
+            "3. 'exemption_or_general_license_applies': boolean (true if an exemption, general license, or specific carve-out permits this fab node)\n"
             "4. 'verdict': string, strictly one of ['RESTRICTION_CONFIRMED', 'CLAIM_REFUTED', 'INCONCLUSIVE']\n"
-            "   - 'RESTRICTION_CONFIRMED': document_matched=true AND fab_node_restricted=true AND confidence_score >= 70\n"
-            "   - 'CLAIM_REFUTED': document confirms exemption, general license, non-restriction, or confidence_score < 30\n"
-            "   - 'INCONCLUSIVE': regulatory text is ambiguous or lacks conclusive scope\n"
+            "   - 'RESTRICTION_CONFIRMED': document_matched=true AND fab_node_restricted=true AND exemption_or_general_license_applies=false\n"
+            "   - 'CLAIM_REFUTED': document_matched=true AND (fab_node_restricted=false OR exemption_or_general_license_applies=true)\n"
+            "   - 'INCONCLUSIVE': document not matched, regulatory text is ambiguous, or lacks conclusive node-specific scope\n"
             "5. 'rationale': a concise 1-sentence legal/regulatory summary.\n\n"
-            "Respond STRICTLY in valid JSON with keys: document_matched, fab_node_restricted, confidence_score, verdict, rationale."
+            "Respond STRICTLY in valid JSON with keys: document_matched, fab_node_restricted, exemption_or_general_license_applies, verdict, rationale."
         )
 
         criteria = (
             "Independently fetch and inspect the regulatory document from the input URL. "
-            "Verify whether the regulatory reference document number is authentic and applies to the target fab node. "
-            "Examine whether the legal trade restrictions explicitly prohibit the fab node or fabrication equipment. "
+            "Verify whether the regulatory reference document number matches the publication, and whether the trade restrictions apply to the target fab node. "
             "REJECT the leader's proposal if: "
             "(1) the leader claims document_matched=true when the document number does not match the publication, "
-            "(2) the leader claims fab_node_restricted=true when the regulation does not apply to the specified technology node, "
-            "(3) the leader proposes verdict='RESTRICTION_CONFIRMED' when fab_node_restricted is false or confidence_score < 70, "
-            "(4) the leader proposes verdict='CLAIM_REFUTED' when the document explicitly enacts a binding trade prohibition on the node, "
-            "(5) the leader's confidence_score deviates by more than 15 points from the regulatory evidence, or "
+            "(2) the leader claims fab_node_restricted=true when the regulation does not prohibit the specified technology node, "
+            "(3) the leader claims exemption_or_general_license_applies=true when no such exemption or authorization exists, "
+            "(4) the leader proposes verdict='RESTRICTION_CONFIRMED' when document_matched is false, fab_node_restricted is false, or exemption_or_general_license_applies is true, "
+            "(5) the leader proposes verdict='CLAIM_REFUTED' when document_matched is false, or when fab_node_restricted is true and no exemption applies, "
             "(6) the leader claims INCONCLUSIVE when the regulatory text provides definitive legal scope. "
-            "Output must be valid JSON with keys: document_matched, fab_node_restricted, confidence_score, verdict, rationale."
+            "Every validator-compatible output must strictly preserve identical boolean determinations and the exact same verdict. "
+            "Output must be valid JSON with keys: document_matched, fab_node_restricted, exemption_or_general_license_applies, verdict, rationale."
         )
 
         consensus_result = gl.eq_principle.prompt_non_comparative(
@@ -574,7 +574,9 @@ class AutonomousSemiconductorSupplyChainEscrow(gl.Contract):
 
         parsed_verdict = CLAIM_INCONCLUSIVE
         rationale = "Consensus fallback resolution."
-        confidence = 0
+        doc_matched = False
+        node_restricted = False
+        exemption = False
         parse_valid = False
 
         try:
@@ -582,19 +584,29 @@ class AutonomousSemiconductorSupplyChainEscrow(gl.Contract):
             cand = str(parsed.get("verdict", "")).strip().upper()
             if cand in (CLAIM_RESTRICTION_CONFIRMED, CLAIM_REFUTED, CLAIM_INCONCLUSIVE):
                 parsed_verdict = cand
-            confidence = int(parsed.get("confidence_score", 0))
+            doc_matched = bool(parsed.get("document_matched", False))
+            node_restricted = bool(parsed.get("fab_node_restricted", False))
+            exemption = bool(parsed.get("exemption_or_general_license_applies", False))
             rationale = str(parsed.get("rationale", "")).strip()[:200]
             parse_valid = True
         except Exception:
             parse_valid = False
 
-        # Strict Metric Binding (CRIT-01 Remediated: Safe Inconclusive Fallback)
-        if parse_valid and parsed_verdict == CLAIM_RESTRICTION_CONFIRMED and confidence >= 70:
-            final_verdict = CLAIM_RESTRICTION_CONFIRMED
-        elif parse_valid and (parsed_verdict == CLAIM_REFUTED or confidence < 30):
-            final_verdict = CLAIM_REFUTED
+        # Consensus Invariance & Cross-Verification (Remediated: Strict factual verification & Safe Fallback)
+        if parse_valid and parsed_verdict == CLAIM_RESTRICTION_CONFIRMED:
+            if doc_matched and node_restricted and not exemption:
+                final_verdict = CLAIM_RESTRICTION_CONFIRMED
+            else:
+                final_verdict = CLAIM_INCONCLUSIVE  # Inconsistent! Safe non-payout fallback
+        elif parse_valid and parsed_verdict == CLAIM_REFUTED:
+            if doc_matched and (not node_restricted or exemption):
+                final_verdict = CLAIM_REFUTED
+            else:
+                final_verdict = CLAIM_INCONCLUSIVE  # Inconsistent! Safe fallback preserves bond
+        elif parse_valid and parsed_verdict == CLAIM_INCONCLUSIVE:
+            final_verdict = CLAIM_INCONCLUSIVE
         else:
-            final_verdict = CLAIM_INCONCLUSIVE  # Safe fallback preserves claimant bond!
+            final_verdict = CLAIM_INCONCLUSIVE  # Corrupt or unparseable JSON safely defaults to INCONCLUSIVE
 
         now_utc = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
         clm.adjudicated_at = u256(now_utc)
@@ -687,7 +699,7 @@ class AutonomousSemiconductorSupplyChainEscrow(gl.Contract):
 
         return (
             "CLAIM_ADJUDICATED: " + clean_c_id + " | Verdict: " + final_verdict
-            + " | Confidence: " + str(confidence) + " | Rationale: " + rationale
+            + " | Rationale: " + rationale
         )
 
     # --------------------------------------------------------------------------

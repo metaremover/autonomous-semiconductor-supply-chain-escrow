@@ -1,12 +1,12 @@
 {
   "contractName": "AutonomousSemiconductorSupplyChainEscrow",
-  "contractAddress": "0x3498f46D90944E136D7688e4C49a62d598Ffa1ea",
-  "transactionHash": "0xc36748d95fa45d3c9f3ab20faf1b0c80aec692dc1c915aae78618632467665c9",
-  "deployerAddress": "0x5148aE320285a7c04de91EF88F2561E5f5dCC636",
+  "contractAddress": "0xB6849D222c6F45Da3b02b801A97DaB2F064591a1",
+  "transactionHash": "0x92d157b959f2f8334f8a8991750eea82c3f486600a7185b239b89805d6a55af8",
+  "deployerAddress": "0xB38748F1DA16678b59cc69386455b04c56FB7b04",
   "network": "GenLayer Studio Testnet",
   "rpcEndpoint": "https://studio.genlayer.com/api",
-  "explorerUrl": "https://explorer-studio.genlayer.com/address/0x3498f46D90944E136D7688e4C49a62d598Ffa1ea",
-  "deployedAt": "2026-10-11T20:07:30.489Z",
+  "explorerUrl": "https://explorer-studio.genlayer.com/address/0xB6849D222c6F45Da3b02b801A97DaB2F064591a1",
+  "deployedAt": "2026-10-19T00:17:36.289Z",
   "initialState": {
     "totalEscrowsCreated": 0,
     "totalVolumeLockedWei": "0",

@@ -51,7 +51,7 @@ class MockGL:
         self.consensus_return_value = json.dumps({
             "document_matched": True,
             "fab_node_restricted": True,
-            "confidence_score": 95,
+            "exemption_or_general_license_applies": False,
             "verdict": "RESTRICTION_CONFIRMED",
             "rationale": "Federal Register and BIS rule formally enact export embargo on sub-3nm GAA fabrication."
         })
@@ -327,7 +327,15 @@ class MockAutonomousSemiconductorSupplyChainEscrow:
         escrow["status"] = self.STATUS_DISPUTED
         return new_c_id
 
-    def adjudicate_export_restriction_claim(self, claim_id: str, custom_verdict: str = None, custom_conf: int = None, simulate_parse_error: bool = False):
+    def adjudicate_export_restriction_claim(
+        self,
+        claim_id: str,
+        custom_verdict: str = None,
+        custom_doc_matched: bool = None,
+        custom_restricted: bool = None,
+        custom_exemption: bool = None,
+        simulate_parse_error: bool = False
+    ):
         assert claim_id in self.claims, "[ERR_CLAIM_NOT_FOUND] Claim not found."
         clm = self.claims[claim_id]
         assert clm["verdict"] == self.CLAIM_PENDING, "[ERR_ALREADY_ADJUDICATED] Claim already adjudicated."
@@ -350,12 +358,15 @@ class MockAutonomousSemiconductorSupplyChainEscrow:
 
         if simulate_parse_error:
             self.gl.corrupt_llm_json = True
-        elif custom_verdict is not None and custom_conf is not None:
+        elif custom_verdict is not None:
             self.gl.corrupt_llm_json = False
+            doc_m = True if custom_doc_matched is None else custom_doc_matched
+            node_r = (custom_verdict == self.CLAIM_RESTRICTION_CONFIRMED) if custom_restricted is None else custom_restricted
+            exemp = False if custom_exemption is None else custom_exemption
             self.gl.consensus_return_value = json.dumps({
-                "document_matched": True,
-                "fab_node_restricted": custom_verdict == self.CLAIM_RESTRICTION_CONFIRMED,
-                "confidence_score": custom_conf,
+                "document_matched": doc_m,
+                "fab_node_restricted": node_r,
+                "exemption_or_general_license_applies": exemp,
                 "verdict": custom_verdict,
                 "rationale": "Test adjudication verdict."
             })
@@ -370,25 +381,39 @@ class MockAutonomousSemiconductorSupplyChainEscrow:
 
         parse_valid = False
         parsed_verdict = self.CLAIM_INCONCLUSIVE
-        confidence = 0
+        doc_matched = False
+        node_restricted = False
+        exemption = False
         rationale = "Consensus fallback resolution."
 
         try:
             parsed = json.loads(consensus_result)
-            parsed_verdict = parsed.get("verdict", self.CLAIM_INCONCLUSIVE)
-            confidence = parsed.get("confidence_score", 0)
-            rationale = parsed.get("rationale", "")
+            cand = str(parsed.get("verdict", "")).strip().upper()
+            if cand in (self.CLAIM_RESTRICTION_CONFIRMED, self.CLAIM_REFUTED, self.CLAIM_INCONCLUSIVE):
+                parsed_verdict = cand
+            doc_matched = bool(parsed.get("document_matched", False))
+            node_restricted = bool(parsed.get("fab_node_restricted", False))
+            exemption = bool(parsed.get("exemption_or_general_license_applies", False))
+            rationale = str(parsed.get("rationale", "")).strip()[:200]
             parse_valid = True
         except Exception:
             parse_valid = False
 
-        # CRIT-01 Remediated Safe Fallback:
-        if parse_valid and parsed_verdict == self.CLAIM_RESTRICTION_CONFIRMED and confidence >= 70:
-            final_verdict = self.CLAIM_RESTRICTION_CONFIRMED
-        elif parse_valid and (parsed_verdict == self.CLAIM_REFUTED or confidence < 30):
-            final_verdict = self.CLAIM_REFUTED
+        # Consensus Invariance & Cross-Verification (Remediated: Strict factual verification & Safe Fallback)
+        if parse_valid and parsed_verdict == self.CLAIM_RESTRICTION_CONFIRMED:
+            if doc_matched and node_restricted and not exemption:
+                final_verdict = self.CLAIM_RESTRICTION_CONFIRMED
+            else:
+                final_verdict = self.CLAIM_INCONCLUSIVE  # Inconsistent! Safe non-payout fallback
+        elif parse_valid and parsed_verdict == self.CLAIM_REFUTED:
+            if doc_matched and (not node_restricted or exemption):
+                final_verdict = self.CLAIM_REFUTED
+            else:
+                final_verdict = self.CLAIM_INCONCLUSIVE  # Inconsistent! Safe fallback preserves bond
+        elif parse_valid and parsed_verdict == self.CLAIM_INCONCLUSIVE:
+            final_verdict = self.CLAIM_INCONCLUSIVE
         else:
-            final_verdict = self.CLAIM_INCONCLUSIVE  # Safe fallback preserves claimant bond!
+            final_verdict = self.CLAIM_INCONCLUSIVE  # Corrupt or unparseable JSON safely defaults to INCONCLUSIVE
 
         now_utc = int(datetime.now(timezone.utc).timestamp())
         clm["adjudicated_at"] = now_utc
@@ -643,7 +668,13 @@ def run_all_tests():
     # Phase 9: Consensus Adjudication: RESTRICTION_CONFIRMED (Force Majeure Refund)
     print("\n[Phase 9] Testing consensus adjudication: RESTRICTION_CONFIRMED (Force Majeure Refund)...")
     total_collateral_in_escrow = advance_amount + topup_amount
-    contract.adjudicate_export_restriction_claim(claim_id, custom_verdict="RESTRICTION_CONFIRMED", custom_conf=95)
+    contract.adjudicate_export_restriction_claim(
+        claim_id,
+        custom_verdict="RESTRICTION_CONFIRMED",
+        custom_doc_matched=True,
+        custom_restricted=True,
+        custom_exemption=False
+    )
     
     assert contract.claims[claim_id]["verdict"] == "RESTRICTION_CONFIRMED"
     assert contract.escrows[escrow_id]["status"] == "EXPORT_RESTRICTED_REFUNDED"
@@ -674,11 +705,59 @@ def run_all_tests():
         url="https://bis.doc.gov/reg-99",
         nonce="nonce_frivolous"
     )
-    contract.adjudicate_export_restriction_claim(claim_id_2, custom_verdict="CLAIM_REFUTED", custom_conf=15)
+    contract.adjudicate_export_restriction_claim(
+        claim_id_2,
+        custom_verdict="CLAIM_REFUTED",
+        custom_doc_matched=True,
+        custom_restricted=False,
+        custom_exemption=False
+    )
     assert contract.claims[claim_id_2]["verdict"] == "CLAIM_REFUTED"
     assert contract.escrows[escrow_id_2]["status"] == "ACTIVE", "Escrow must unlock to ACTIVE after refuted claim"
     assert contract.claimable_balances[supplier] == bond_amount, "Supplier credited with slashed bond indemnity"
     print("  PASS: Frivolous claim bond slashed to supplier & escrow unlocked back to ACTIVE.")
+
+    # Phase 10b: Inconsistent RESTRICTION_CONFIRMED with fab_node_restricted=False -> Safe Fallback to INCONCLUSIVE
+    print("\n[Phase 10b] Testing Inconsistent RESTRICTION_CONFIRMED (contradictory boolean fields)...")
+    claim_id_inconsistent = contract.submit_export_restriction_claim(
+        caller=claimant,
+        value=bond_amount,
+        escrow_id=escrow_id_2,
+        doc_number="FR-INCONSISTENT-01",
+        url="https://federalregister.gov/inconsistent-01",
+        nonce="nonce_inconsistent_1"
+    )
+    contract.adjudicate_export_restriction_claim(
+        claim_id_inconsistent,
+        custom_verdict="RESTRICTION_CONFIRMED",
+        custom_doc_matched=True,
+        custom_restricted=False,
+        custom_exemption=False
+    )
+    assert contract.claims[claim_id_inconsistent]["verdict"] == "INCONCLUSIVE", "Contradictory fields must fallback to INCONCLUSIVE!"
+    assert contract.escrows[escrow_id_2]["status"] == "ACTIVE", "Escrow must remain ACTIVE on safe fallback!"
+    print("  PASS: Inconsistent RESTRICTION_CONFIRMED safely fell back to INCONCLUSIVE with bond returned.")
+
+    # Phase 10c: Inconsistent CLAIM_REFUTED with document_matched=False -> Safe Fallback to INCONCLUSIVE
+    print("\n[Phase 10c] Testing Inconsistent CLAIM_REFUTED with document_matched=False...")
+    claim_id_inconsistent_2 = contract.submit_export_restriction_claim(
+        caller=claimant,
+        value=bond_amount,
+        escrow_id=escrow_id_2,
+        doc_number="FR-INCONSISTENT-02",
+        url="https://federalregister.gov/inconsistent-02",
+        nonce="nonce_inconsistent_2"
+    )
+    contract.adjudicate_export_restriction_claim(
+        claim_id_inconsistent_2,
+        custom_verdict="CLAIM_REFUTED",
+        custom_doc_matched=False,
+        custom_restricted=False,
+        custom_exemption=False
+    )
+    assert contract.claims[claim_id_inconsistent_2]["verdict"] == "INCONCLUSIVE", "Unmatched document must fallback to INCONCLUSIVE!"
+    assert contract.escrows[escrow_id_2]["status"] == "ACTIVE", "Escrow must remain ACTIVE on safe fallback!"
+    print("  PASS: Inconsistent CLAIM_REFUTED safely fell back to INCONCLUSIVE with bond returned.")
 
     # Phase 11: Fail-Closed Web Evidence Ingestion & Safe Parse Error Fallback (CRIT-01)
     print("\n[Phase 11] Testing Safe Fallback on JSON Parsing Error (CRIT-01 Remediated)...")

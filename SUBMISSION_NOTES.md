@@ -1,9 +1,10 @@
-### Autonomous Semiconductor Supply Chain & EAR Export Escrow
-Autonomous Wafer Fab Slot Advance Escrow with U.S. Federal Register & BIS Export Control (EAR) Regulatory Adjudication on GenLayer. Eliminates commercial litigation over advanced wafer slots (2nm/3nm GAA, CoWoS packaging) following geopolitical export bans.
+== AUTONOMOUS SEMICONDUCTOR ESCROW (CONSENSUS INVARIANCE REDESIGN) ==
+[1. SYSTEM CLASS & PURPOSE]
+Autonomous Wafer Fab Slot Advance Escrow on GenLayer adjudicating BIS / Federal Register export controls to eliminate international force majeure litigation over sub-3nm chip production runs.
 
-### Core Hardcore Security Protections
-- Pinned Ingestion & SSRF Defense: Queries official domains (federalregister.gov, bis.doc.gov). Rejects SSRF, credentials (@), and non-42-char hex.
-- 100% Backed Funds & Solvency: All deposits/bonds via @gl.public.write.payable. TVL accurately tracks live balances without synthetic debt or double-deduction.
-- Dispute Locking: Active claims transition escrow to DISPUTED, blocking front-running deliveries.
-- Safe Inconclusive Fallback: LLM parsing glitches preserve claimant bonds instead of slashing.
-- Pull-Pattern Recovery: Failed transfers safely credit recoverable balances.
+[2. CONSENSUS INVARIANCE & STEWARD REMEDIATION]
+• Zero Fuzzy Thresholds: Completely eliminated the 15-point confidence allowance and all numerical confidence scoring from settlement and validation criteria.
+• Strict Factual Consensus Binding: Every validator-compatible output must strictly preserve identical factual boolean determinations: (1) document_matched, (2) fab_node_restricted, and (3) exemption_or_general_license_applies, binding the exact same deterministic verdict.
+• Safe Inconclusive Fallback: Any contradictory boolean combination or parsing failure safely resolves to CLAIM_INCONCLUSIVE, preserving collateral and bond with zero payout and zero slashing.
+
+Contract: 0xB6849D222c6F45Da3b02b801A97DaB2F064591a1
